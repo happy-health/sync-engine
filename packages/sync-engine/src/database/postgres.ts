@@ -65,19 +65,24 @@ export class PostgresClient {
     T extends {
       [Key: string]: any // eslint-disable-line @typescript-eslint/no-explicit-any
     },
-  >(entries: T[], table: string, tableSchema: EntitySchema, syncTimestamp?: string): Promise<T[]> {
+  >(
+    entries: T[],
+    table: string,
+    tableSchema: EntitySchema,
+    syncTimestamp?: string,
+    refetchOnSkip?: (id: string) => Promise<T | undefined>
+  ): Promise<T[]> {
     const timestamp = syncTimestamp || new Date().toISOString()
 
     if (!entries.length) return []
 
     // Max 5 in parallel to avoid exhausting connection pool
     const chunkSize = 5
-    const results: pg.QueryResult<T>[] = []
 
     for (let i = 0; i < entries.length; i += chunkSize) {
       const chunk = entries.slice(i, i + chunkSize)
 
-      const queries: Promise<pg.QueryResult<T>>[] = []
+      const queries: Promise<pg.QueryResult>[] = []
       chunk.forEach((entry) => {
         // Inject the values
         const cleansed = this.cleanseArrayField(entry)
@@ -97,10 +102,56 @@ export class PostgresClient {
         queries.push(this.pool.query(prepared.text, prepared.values))
       })
 
-      results.push(...(await Promise.all(queries)))
+      const chunkResults = await Promise.all(queries)
+
+      // Repair is a webhook-path concern: callers pass a prebuilt callback (see
+      // StripeSync.refetchCallbacks) for every entity that has a retrieve API,
+      // but it only fires when a webhook syncTimestamp is present. Backfills
+      // (no timestamp) already hold canonical data and must never fan out
+      // per-row retrieves.
+      if (!refetchOnSkip || syncTimestamp === undefined) continue
+
+      for (let k = 0; k < chunkResults.length; k++) {
+        // Each write reports {applied, is_tie} from a single statement
+        // (writable CTE, one snapshot — see the builder below). A guard-skipped
+        // UPDATE on an existing row (an INSERT always applies) is either a
+        // same-second tie — webhook sync timestamps come from event.created at
+        // integer-second resolution, so two events for one object inside the
+        // same second produce equal last_synced_at values the strict `<` guard
+        // cannot order — or a strictly-stale redelivery, which is the guard
+        // working as intended and needs no repair.
+        const verdict = chunkResults[k].rows[0] as { applied: boolean; is_tie: boolean | null }
+        if (verdict.applied || !verdict.is_tie) continue
+
+        // A tie is repaired by refetching canonical state from Stripe and
+        // retrying the upsert once with a wall-clock timestamp: the refetched
+        // content is authoritative, so it cannot regress the row, and
+        // wall-clock is the domain the backfill paths already write in.
+        //
+        // Deliberately no per-entity locking: the residual
+        // stale-read-last-write race is accepted and self-heals via
+        // the next event or POST /sync/single/:id. If the retry is also skipped
+        // a concurrent newer write won — leave it, do not loop.
+        const entity = await refetchOnSkip(chunk[k].id)
+        if (entity === undefined) continue
+
+        const cleansed = this.cleanseArrayField(entity)
+        cleansed.last_synced_at = new Date().toISOString()
+
+        const retrySql = this.constructUpsertWithTimestampProtectionSql(
+          this.config.schema,
+          table,
+          tableSchema
+        )
+        const prepared = sql(retrySql, {
+          useNullForMissing: true,
+        })(cleansed)
+
+        await this.pool.query(prepared.text, prepared.values)
+      }
     }
 
-    return results.flatMap((it) => it.rows)
+    return []
   }
 
   async findMissingEntries(table: string, ids: string[]): Promise<string[]> {
@@ -157,26 +208,47 @@ export class PostgresClient {
   }
 
   /**
-   * Returns an (yesql formatted) upsert function with timestamp protection.
+   * Returns an (yesql formatted) upsert statement with timestamp protection,
+   * wrapped in a writable CTE that reports the outcome of the write in the
+   * same statement. All CTE sub-statements share one snapshot, so `prev`
+   * reflects the stored row version the ON CONFLICT guard evaluated — the
+   * tie/stale verdict is not affected by a concurrent write landing between
+   * separate queries.
    *
    * The WHERE clause in ON CONFLICT DO UPDATE only applies to the conflicting row
    * (the row being updated), not to all rows in the table. PostgreSQL ensures that
    * the condition is evaluated only for the specific row that conflicts with the INSERT.
    *
+   * Returns one row: `{ applied, is_tie }`.
+   *
+   * - applied = true: the INSERT or the guarded UPDATE applied.
+   * - applied = false: the guard skipped an UPDATE on an existing row
+   *   (an INSERT always applies), i.e. stored last_synced_at >= attempted.
+   * - is_tie (only meaningful when applied = false): stored <= attempted,
+   *   i.e. equal — a same-second tie that is unresolvable locally.
+   *   is_tie = false means strictly stale (stored > attempted).
    *
    * eg:
-   *   INSERT INTO "stripe"."charges" (
-   *     "id", "amount", "created", "last_synced_at"
+   *   WITH prev AS (
+   *     SELECT last_synced_at FROM "stripe"."charges" WHERE id = :id
+   *   ),
+   *   upsert AS (
+   *     INSERT INTO "stripe"."charges" (
+   *       "id", "amount", "created", "last_synced_at"
+   *     )
+   *     VALUES (
+   *       :id, :amount, :created, :last_synced_at
+   *     )
+   *     ON CONFLICT (id) DO UPDATE SET
+   *       "amount" = EXCLUDED."amount",
+   *       "created" = EXCLUDED."created",
+   *       last_synced_at = :last_synced_at
+   *     WHERE "charges"."last_synced_at" IS NULL
+   *        OR "charges"."last_synced_at" < :last_synced_at
+   *     RETURNING id
    *   )
-   *   VALUES (
-   *     :id, :amount, :created, :last_synced_at
-   *   )
-   *   ON CONFLICT (id) DO UPDATE SET
-   *     "amount" = EXCLUDED."amount",
-   *     "created" = EXCLUDED."created",
-   *     last_synced_at = :last_synced_at
-   *   WHERE "charges"."last_synced_at" IS NULL
-   *      OR "charges"."last_synced_at" < :last_synced_at;
+   *   SELECT EXISTS (SELECT 1 FROM upsert) AS applied,
+   *          (SELECT (last_synced_at <= :last_synced_at) FROM prev) AS is_tie;
    */
   private constructUpsertWithTimestampProtectionSql = (
     schema: string,
@@ -187,20 +259,30 @@ export class PostgresClient {
     const properties = tableSchema.properties
 
     return `
-      INSERT INTO "${schema}"."${table}" (
-        ${properties.map((x) => `"${x}"`).join(',')}, "last_synced_at"
+      WITH prev AS (
+        SELECT "last_synced_at" FROM "${schema}"."${table}"
+        WHERE id = :id
+      ),
+      upsert AS (
+        INSERT INTO "${schema}"."${table}" (
+          ${properties.map((x) => `"${x}"`).join(',')}, "last_synced_at"
+        )
+        VALUES (
+          ${properties.map((x) => `:${x}`).join(',')}, :last_synced_at
+        )
+        ON CONFLICT (${conflict}) DO UPDATE SET
+          ${properties
+            .filter((x) => x !== 'last_synced_at')
+            .map((x) => `"${x}" = EXCLUDED."${x}"`)
+            .join(',')},
+          last_synced_at = :last_synced_at
+        WHERE "${table}"."last_synced_at" IS NULL
+           OR "${table}"."last_synced_at" < :last_synced_at
+        RETURNING id
       )
-      VALUES (
-        ${properties.map((x) => `:${x}`).join(',')}, :last_synced_at
-      )
-      ON CONFLICT (${conflict}) DO UPDATE SET
-        ${properties
-          .filter((x) => x !== 'last_synced_at')
-          .map((x) => `"${x}" = EXCLUDED."${x}"`)
-          .join(',')},
-        last_synced_at = :last_synced_at
-      WHERE "${table}"."last_synced_at" IS NULL 
-         OR "${table}"."last_synced_at" < :last_synced_at;`
+      SELECT
+        EXISTS (SELECT 1 FROM upsert) AS applied,
+        (SELECT ("last_synced_at" <= :last_synced_at) FROM prev) AS is_tie;`
   }
 
   /**

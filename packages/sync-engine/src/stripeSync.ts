@@ -603,6 +603,92 @@ export class StripeSync {
     return { entity, refetched: false }
   }
 
+  /**
+   * Wraps a Stripe retrieve fn into a refetch-on-skip callback accepted by
+   * upsertManyWithTimestampProtection: when the timestamp guard drops a
+   * same-second write, the row is repaired by refetching canonical state and
+   * re-upserting once at wall-clock now.
+   *
+   * Any retrieve error — including resource_missing on deleted objects — is swallowed
+   * to `undefined` with a warn log so the write stays dropped rather than surfacing as
+   * a webhook 400.
+   */
+  private refetchOnSkip<T extends { id?: string }>(
+    fetchFn: (id: string) => Promise<T | undefined>,
+    label: string
+  ): (id: string) => Promise<T | undefined> {
+    return (id) =>
+      fetchFn(id).catch((err) => {
+        this.config.logger?.warn({ err, id, label }, 'skipping refetch after dropped upsert')
+        return undefined
+      })
+  }
+
+  /**
+   * Canonical repair callbacks for timestamp-guard ties, built once and keyed by
+   * table. upsertManyWithTimestampProtection invokes them only on the webhook
+   * path (when a syncTimestamp is present) — backfills already hold canonical
+   * data and must never fan out per-row retrieves.
+   *
+   * Tables with no entry are deliberately left unwired — entities without a
+   * single-entity retrieve (and deleted-customer tombstones) self-heal on the
+   * next event.
+   */
+  private readonly refetchCallbacks = {
+    charges: this.refetchOnSkip((id) => this.stripe.charges.retrieve(id), 'charge'),
+    credit_notes: this.refetchOnSkip((id) => this.stripe.creditNotes.retrieve(id), 'credit_note'),
+    checkout_sessions: this.refetchOnSkip(
+      (id) => this.stripe.checkout.sessions.retrieve(id),
+      'checkout_session'
+    ),
+    early_fraud_warnings: this.refetchOnSkip(
+      (id) => this.stripe.radar.earlyFraudWarnings.retrieve(id),
+      'early_fraud_warning'
+    ),
+    refunds: this.refetchOnSkip((id) => this.stripe.refunds.retrieve(id), 'refund'),
+    reviews: this.refetchOnSkip((id) => this.stripe.reviews.retrieve(id), 'review'),
+    customers: this.refetchOnSkip(
+      // A customer deleted between event and refetch stays dropped, matching
+      // the unprotected tombstone write path.
+      (id) =>
+        this.stripe.customers
+          .retrieve(id)
+          .then((customer) => (customer.deleted ? undefined : customer)),
+      'customer'
+    ),
+    disputes: this.refetchOnSkip((id) => this.stripe.disputes.retrieve(id), 'dispute'),
+    invoices: this.refetchOnSkip((id) => this.stripe.invoices.retrieve(id), 'invoice'),
+    invoice_payments: this.refetchOnSkip(
+      (id) => this.stripe.invoicePayments.retrieve(id),
+      'invoice_payment'
+    ),
+    plans: this.refetchOnSkip((id) => this.stripe.plans.retrieve(id), 'plan'),
+    prices: this.refetchOnSkip((id) => this.stripe.prices.retrieve(id), 'price'),
+    products: this.refetchOnSkip((id) => this.stripe.products.retrieve(id), 'product'),
+    payment_intents: this.refetchOnSkip(
+      (id) => this.stripe.paymentIntents.retrieve(id),
+      'payment_intent'
+    ),
+    payment_methods: this.refetchOnSkip(
+      (id) => this.stripe.paymentMethods.retrieve(id),
+      'payment_method'
+    ),
+    setup_intents: this.refetchOnSkip(
+      (id) => this.stripe.setupIntents.retrieve(id),
+      'setup_intent'
+    ),
+    tax_ids: this.refetchOnSkip((id) => this.stripe.taxIds.retrieve(id), 'tax_id'),
+    subscription_schedules: this.refetchOnSkip(
+      (id) => this.stripe.subscriptionSchedules.retrieve(id),
+      'subscription_schedule'
+    ),
+    subscriptions: this.refetchOnSkip(
+      (id) => this.stripe.subscriptions.retrieve(id),
+      'subscription'
+    ),
+    features: this.refetchOnSkip((id) => this.stripe.entitlements.features.retrieve(id), 'feature'),
+  }
+
   async syncSingleEntity(stripeId: string) {
     if (stripeId.startsWith('cus_')) {
       return this.stripe.customers.retrieve(stripeId).then((it) => {
@@ -1077,7 +1163,8 @@ export class StripeSync {
       charges,
       'charges',
       chargeSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.charges
     )
   }
 
@@ -1120,7 +1207,8 @@ export class StripeSync {
       creditNotes,
       'credit_notes',
       creditNoteSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.credit_notes
     )
   }
 
@@ -1143,7 +1231,8 @@ export class StripeSync {
       checkoutSessions,
       'checkout_sessions',
       checkoutSessionSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.checkout_sessions
     )
 
     await this.fillCheckoutSessionsLineItems(
@@ -1170,7 +1259,8 @@ export class StripeSync {
       earlyFraudWarnings,
       'early_fraud_warnings',
       earlyFraudWarningSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.early_fraud_warnings
     )
   }
 
@@ -1190,7 +1280,8 @@ export class StripeSync {
       refunds,
       'refunds',
       refundSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.refunds
     )
   }
 
@@ -1210,7 +1301,8 @@ export class StripeSync {
       reviews,
       'reviews',
       reviewSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.reviews
     )
   }
 
@@ -1225,8 +1317,12 @@ export class StripeSync {
       nonDeletedCustomers,
       'customers',
       customerSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.customers
     )
+    // Tombstones stay unprotected: customers.retrieve throws resource_missing on
+    // deleted objects, so a same-second created->deleted race keeps a stale
+    // non-deleted row until the next event. See refetchOnSkip.
     await this.postgresClient.upsertManyWithTimestampProtection(
       deletedCustomers,
       'customers',
@@ -1261,7 +1357,8 @@ export class StripeSync {
       disputes,
       'disputes',
       disputeSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.disputes
     )
   }
 
@@ -1285,7 +1382,8 @@ export class StripeSync {
       invoices,
       'invoices',
       invoiceSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.invoices
     )
   }
 
@@ -1336,7 +1434,8 @@ export class StripeSync {
       invoicePayments,
       'invoice_payments',
       invoicePaymentSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.invoice_payments
     )
   }
 
@@ -1353,7 +1452,8 @@ export class StripeSync {
       plans,
       'plans',
       planSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.plans
     )
   }
 
@@ -1374,7 +1474,8 @@ export class StripeSync {
       prices,
       'prices',
       priceSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.prices
     )
   }
 
@@ -1390,7 +1491,8 @@ export class StripeSync {
       products,
       'products',
       productSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.products
     )
   }
 
@@ -1422,7 +1524,8 @@ export class StripeSync {
       paymentIntents,
       'payment_intents',
       paymentIntentSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.payment_intents
     )
   }
 
@@ -1439,7 +1542,8 @@ export class StripeSync {
       paymentMethods,
       'payment_methods',
       paymentMethodsSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.payment_methods
     )
   }
 
@@ -1456,7 +1560,8 @@ export class StripeSync {
       setupIntents,
       'setup_intents',
       setupIntentsSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.setup_intents
     )
   }
 
@@ -1473,7 +1578,8 @@ export class StripeSync {
       taxIds,
       'tax_ids',
       taxIdSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.tax_ids
     )
   }
 
@@ -1598,7 +1704,8 @@ export class StripeSync {
       subscriptionSchedules,
       'subscription_schedules',
       subscriptionScheduleSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.subscription_schedules
     )
 
     return rows
@@ -1624,7 +1731,8 @@ export class StripeSync {
       subscriptions,
       'subscriptions',
       subscriptionSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.subscriptions
     )
 
     // Upsert subscription items into a separate table
@@ -1664,7 +1772,8 @@ export class StripeSync {
       features,
       'features',
       featureSchema,
-      syncTimestamp
+      syncTimestamp,
+      this.refetchCallbacks.features
     )
   }
 

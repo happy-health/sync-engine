@@ -703,6 +703,25 @@ export const mockStripe = {
       })
     ),
   },
+  setupIntents: {
+    retrieve: vitest.fn((id) =>
+      Promise.resolve({
+        id,
+        object: 'setup_intent',
+        cancellation_reason: null,
+        created: 1672656971,
+        customer: 'cus_N3KrCDMGLNc16B',
+        description: null,
+        latest_attempt: 'setatt_1MLlgdJDPojXS6LNqKubMsPr',
+        mandate: null,
+        on_behalf_of: null,
+        payment_method: 'pm_1MJEWOJDPojXS6LNUELZ8Byt',
+        single_use_mandate: null,
+        status: 'succeeded',
+        usage: 'off_session',
+      })
+    ),
+  },
   products: {
     retrieve: vitest.fn((id) =>
       Promise.resolve({
