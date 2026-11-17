@@ -175,6 +175,55 @@ describe('same-second upsert protection', () => {
   })
 
   /**
+   * Concurrent first-insert race: two webhook events for a NEW object in the
+   * same second, processed in parallel. Writer A's INSERT commits between
+   * writer B's prev snapshot (empty — A was still uncommitted) and B's
+   * ON CONFLICT evaluation (which then skips on the equal timestamp). With
+   * no row in prev, is_tie would be NULL and the write dropped without a
+   * refetch — the same loss this patch exists to repair.
+   *
+   * Writer A is simulated as a plain uncommitted INSERT on a second
+   * connection: the boundary being tested is only "a conflicting row
+   * committed mid-statement", which an open transaction reproduces exactly.
+   */
+  test('f: concurrent insert commits between prev snapshot and conflict — still refetches', async () => {
+    const id = `pi_same_second_f_${runId}`
+    const created = 1700000600
+    const succeededEvent = await import(`./stripe/payment_intent_succeeded.json`).then(
+      ({ default: d }) => cloneEvent(d as Stripe.Event, id, created, 'succeeded')
+    )
+    const entity = succeededEvent.data.object as Stripe.PaymentIntent
+
+    mockStripe.paymentIntents.retrieve.mockImplementation((id: string) =>
+      Promise.resolve({ ...entity, id })
+    )
+
+    const winner = await stripeSync.postgresClient.pool.connect()
+    await winner.query('BEGIN')
+    await winner.query(
+      `INSERT INTO stripe.payment_intents (id, status, last_synced_at)
+       VALUES ($1, 'succeeded', to_timestamp($2))`,
+      [id, created]
+    )
+
+    // This statement's prev snapshot is empty (A is uncommitted); its INSERT
+    // then blocks on the speculative conflict until the winner commits.
+    const blocked = stripeSync.upsertPaymentIntents(
+      [entity],
+      false,
+      new Date(created * 1000).toISOString()
+    )
+    // Let B's statement reach the server and park on A's uncommitted row.
+    await new Promise((r) => setTimeout(r, 200))
+    await winner.query('COMMIT')
+    winner.release()
+    await blocked
+
+    expect(await paymentIntentStatus(id)).toEqual('succeeded')
+    expect(mockStripe.paymentIntents.retrieve).toHaveBeenCalledTimes(1)
+  })
+
+  /**
    * Strictly-stale control: a stored row written by a NEWER event must not
    * trigger a refetch at all — the guard is working as intended and the
    * repair path only fires on ties (or unknown-concurrent skips).

@@ -151,6 +151,8 @@ export class PostgresClient {
       }
     }
 
+    // Upstream parity: the guarded upsert has no RETURNING clause, so
+    // callers have always received an empty array from this method.
     return []
   }
 
@@ -248,7 +250,9 @@ export class PostgresClient {
    *     RETURNING id
    *   )
    *   SELECT EXISTS (SELECT 1 FROM upsert) AS applied,
-   *          (SELECT (last_synced_at <= :last_synced_at) FROM prev) AS is_tie;
+   *          COALESCE(
+   *            (SELECT (last_synced_at <= :last_synced_at) FROM prev), true
+   *          ) AS is_tie;
    */
   private constructUpsertWithTimestampProtectionSql = (
     schema: string,
@@ -282,7 +286,13 @@ export class PostgresClient {
       )
       SELECT
         EXISTS (SELECT 1 FROM upsert) AS applied,
-        (SELECT ("last_synced_at" <= :last_synced_at) FROM prev) AS is_tie;`
+        -- A skipped upsert guarantees a stored row with ts >= attempted (the
+        -- ON CONFLICT guard cannot fail otherwise). An empty prev then means
+        -- the row was inserted by a concurrent writer mid-statement — tie or
+        -- stale-concurrent, either way canonical refetch is safe.
+        COALESCE(
+          (SELECT ("last_synced_at" <= :last_synced_at) FROM prev), true
+        ) AS is_tie;`
   }
 
   /**
