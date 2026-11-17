@@ -200,6 +200,9 @@ describe('same-second upsert protection', () => {
 
     const winner = await stripeSync.postgresClient.pool.connect()
     await winner.query('BEGIN')
+    const {
+      rows: [{ txid }],
+    } = await winner.query<{ txid: string }>('select txid_current()::text as txid')
     await winner.query(
       `INSERT INTO stripe.payment_intents (id, status, last_synced_at)
        VALUES ($1, 'succeeded', to_timestamp($2))`,
@@ -213,8 +216,23 @@ describe('same-second upsert protection', () => {
       false,
       new Date(created * 1000).toISOString()
     )
-    // Let B's statement reach the server and park on A's uncommitted row.
-    await new Promise((r) => setTimeout(r, 200))
+    // Wait until B's statement is observably parked on A's uncommitted row:
+    // a speculative-insertion conflict shows in pg_locks as a non-granted
+    // transactionid lock on the winner's xid. Polling the database beats a
+    // fixed sleep — a slow CI connection would otherwise let the winner
+    // commit before B even arrives, silently skipping the prev-empty branch
+    // under test.
+    for (let i = 0; i < 100; i++) {
+      const { rows } = await stripeSync.postgresClient.query(
+        `select 1 from pg_locks
+         where locktype = 'transactionid' and transactionid = $1::xid and not granted
+         limit 1`,
+        [txid]
+      )
+      if (rows.length) break
+      if (i === 99) throw new Error('blocked upsert never waited on the winner transaction')
+      await new Promise((r) => setTimeout(r, 20))
+    }
     await winner.query('COMMIT')
     winner.release()
     await blocked
