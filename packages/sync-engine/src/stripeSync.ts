@@ -633,10 +633,26 @@ export class StripeSync {
    * Tables with no entry are deliberately left unwired — entities without a
    * single-entity retrieve (and deleted-customer tombstones) self-heal on the
    * next event.
+   *
+   * Entries for entities with expandable list fields (charges, credit_notes,
+   * invoices, subscriptions) run the same expandEntity normalization as the
+   * upsert path so a tie retry never writes back a truncated list.
    */
   private readonly refetchCallbacks = {
-    charges: this.refetchOnSkip((id) => this.stripe.charges.retrieve(id), 'charge'),
-    credit_notes: this.refetchOnSkip((id) => this.stripe.creditNotes.retrieve(id), 'credit_note'),
+    charges: this.refetchOnSkip(async (id) => {
+      const charge = await this.stripe.charges.retrieve(id)
+      await this.expandEntity([charge], 'refunds', (chargeId) =>
+        this.stripe.refunds.list({ charge: chargeId, limit: 100 })
+      )
+      return charge
+    }, 'charge'),
+    credit_notes: this.refetchOnSkip(async (id) => {
+      const creditNote = await this.stripe.creditNotes.retrieve(id)
+      await this.expandEntity([creditNote], 'lines', (creditNoteId) =>
+        this.stripe.creditNotes.listLineItems(creditNoteId, { limit: 100 })
+      )
+      return creditNote
+    }, 'credit_note'),
     checkout_sessions: this.refetchOnSkip(
       (id) => this.stripe.checkout.sessions.retrieve(id),
       'checkout_session'
@@ -657,7 +673,13 @@ export class StripeSync {
       'customer'
     ),
     disputes: this.refetchOnSkip((id) => this.stripe.disputes.retrieve(id), 'dispute'),
-    invoices: this.refetchOnSkip((id) => this.stripe.invoices.retrieve(id), 'invoice'),
+    invoices: this.refetchOnSkip(async (id) => {
+      const invoice = await this.stripe.invoices.retrieve(id)
+      await this.expandEntity([invoice], 'lines', (invoiceId) =>
+        this.stripe.invoices.listLineItems(invoiceId, { limit: 100 })
+      )
+      return invoice
+    }, 'invoice'),
     invoice_payments: this.refetchOnSkip(
       (id) => this.stripe.invoicePayments.retrieve(id),
       'invoice_payment'
@@ -682,10 +704,13 @@ export class StripeSync {
       (id) => this.stripe.subscriptionSchedules.retrieve(id),
       'subscription_schedule'
     ),
-    subscriptions: this.refetchOnSkip(
-      (id) => this.stripe.subscriptions.retrieve(id),
-      'subscription'
-    ),
+    subscriptions: this.refetchOnSkip(async (id) => {
+      const subscription = await this.stripe.subscriptions.retrieve(id)
+      await this.expandEntity([subscription], 'items', (subscriptionId) =>
+        this.stripe.subscriptionItems.list({ subscription: subscriptionId, limit: 100 })
+      )
+      return subscription
+    }, 'subscription'),
     features: this.refetchOnSkip((id) => this.stripe.entitlements.features.retrieve(id), 'feature'),
   }
 
