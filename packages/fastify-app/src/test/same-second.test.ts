@@ -311,4 +311,68 @@ describe('same-second upsert protection', () => {
       await revalidatingSync.postgresClient.close()
     }
   })
+
+  /**
+   * Subscription child rows follow the repaired parent: a tie retry writes
+   * the canonical subscription, and its items must be synced from that same
+   * canonical object — not from the rejected webhook payload, whose items
+   * would tie with the earlier event's rows and whose list would drive the
+   * deleted-item tombstoning.
+   */
+  test('i: same-second subscription tie resyncs items from the canonical subscription', async () => {
+    const id = `sub_same_second_i_${runId}`
+    const keptItem = `si_kept_i_${runId}`
+    const removedItem = `si_removed_i_${runId}`
+    const created = 1700000900
+
+    const subscriptionEvent = (await import(`./stripe/subscription_updated.json`).then(
+      ({ default: d }) => d
+    )) as Stripe.Event
+    const withItems = (status: string, items: Array<[string, number]>): Stripe.Event => {
+      const event = cloneEvent(subscriptionEvent, id, created, status)
+      const subscription = event.data.object as Stripe.Subscription
+      const template = subscription.items.data[0]
+      subscription.items = {
+        ...subscription.items,
+        data: items.map(([itemId, quantity]) => ({
+          ...template,
+          id: itemId,
+          quantity,
+          subscription: id,
+        })),
+        has_more: false,
+      }
+      return event
+    }
+
+    const firstEvent = withItems('incomplete', [
+      [keptItem, 1],
+      [removedItem, 1],
+    ])
+    const tiedEvent = withItems('active', [
+      [keptItem, 1],
+      [removedItem, 1],
+    ])
+    const canonical = withItems('active', [[keptItem, 3]]).data.object as Stripe.Subscription
+    mockStripe.subscriptions.retrieve.mockResolvedValue(canonical)
+
+    await stripeSync.processEvent(firstEvent)
+    await stripeSync.processEvent(tiedEvent)
+
+    const { rows: parent } = await stripeSync.postgresClient.query(
+      'select status from stripe.subscriptions where id = $1',
+      [id]
+    )
+    expect(parent[0].status).toEqual('active')
+
+    const { rows: items } = await stripeSync.postgresClient.query(
+      'select id, quantity, deleted from stripe.subscription_items where subscription = $1 order by id',
+      [id]
+    )
+    expect(items).toEqual([
+      { id: keptItem, quantity: 3, deleted: false },
+      { id: removedItem, quantity: 1, deleted: true },
+    ])
+    expect(mockStripe.subscriptions.retrieve).toHaveBeenCalledTimes(1)
+  })
 })

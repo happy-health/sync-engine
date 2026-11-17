@@ -630,9 +630,11 @@ export class StripeSync {
    * path (when a syncTimestamp is present) — backfills already hold canonical
    * data and must never fan out per-row retrieves.
    *
-   * Tables with no entry are deliberately left unwired — entities without a
-   * single-entity retrieve (and deleted-customer tombstones) self-heal on the
-   * next event.
+   * Tables with no entry are deliberately left unwired: child rows synced as
+   * a set from a parent event (subscription_items, checkout_session_line_items,
+   * active_entitlements) and deleted-customer tombstones. Subscription items
+   * follow their repaired parent (see upsertSubscriptions); the rest
+   * self-heal on the next parent event.
    *
    * Entries for entities with expandable list fields (charges, credit_notes,
    * invoices, subscriptions) run the same expandEntity normalization as the
@@ -1751,24 +1753,43 @@ export class StripeSync {
       this.stripe.subscriptionItems.list({ subscription: id, limit: 100 })
     )
 
+    // A tie retry repairs the parent row from the canonical subscription.
+    // Record it so the item sync below runs from that same canonical state
+    // instead of the webhook payload the guard just rejected.
+    const repaired = new Map<string, Stripe.Subscription>()
+
     // Run it
     const rows = await this.postgresClient.upsertManyWithTimestampProtection(
       subscriptions,
       'subscriptions',
       subscriptionSchema,
       syncTimestamp,
-      this.refetchCallbacks.subscriptions
+      async (id) => {
+        const canonical = await this.refetchCallbacks.subscriptions(id)
+        if (canonical) repaired.set(id, canonical)
+        return canonical
+      }
     )
+
+    const fromPayload = subscriptions.filter((subscription) => !repaired.has(subscription.id))
+    const fromCanonical = [...repaired.values()]
 
     // Upsert subscription items into a separate table
     // need to run after upsert subscription cos subscriptionItems will reference the subscription
-    const allSubscriptionItems = subscriptions.flatMap((subscription) => subscription.items.data)
-    await this.upsertSubscriptionItems(allSubscriptionItems, syncTimestamp)
+    await this.upsertSubscriptionItems(
+      fromPayload.flatMap((subscription) => subscription.items.data),
+      syncTimestamp
+    )
+    // Canonical items are stamped at wall-clock like their repaired parent,
+    // so a same-second item row from the earlier event cannot block them.
+    await this.upsertSubscriptionItems(
+      fromCanonical.flatMap((subscription) => subscription.items.data)
+    )
 
     // We have to mark existing subscription item in db as deleted
     // if it doesn't exist in current subscriptionItems list
     const markSubscriptionItemsDeleted: Promise<{ rowCount: number }>[] = []
-    for (const subscription of subscriptions) {
+    for (const subscription of [...fromPayload, ...fromCanonical]) {
       const subscriptionItems = subscription.items.data
       const subItemIds = subscriptionItems.map((x: Stripe.SubscriptionItem) => x.id)
       markSubscriptionItemsDeleted.push(
