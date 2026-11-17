@@ -244,4 +244,53 @@ describe('same-second upsert protection', () => {
     expect(await paymentIntentStatus(id)).toEqual('succeeded')
     expect(mockStripe.paymentIntents.retrieve).not.toHaveBeenCalled()
   })
+
+  /**
+   * Wall-clock write then a same-second event: revalidated objects write
+   * last_synced_at at millisecond precision (new Date()), so a same-second
+   * event carrying event.created compares strictly-stale at ms resolution
+   * even though the two cannot be ordered — the stored second IS the
+   * attempted write's second. The repair path must still fire.
+   *
+   * Both events use the current wall-clock second because the revalidated
+   * write is stamped at real now() — in production, events arrive promptly.
+   */
+  test('h: same-second event after a revalidated wall-clock write still refetches', async () => {
+    const id = `pi_same_second_h_${runId}`
+    const created = Math.floor(Date.now() / 1000)
+    const createdEvent = await import(`./stripe/payment_intent_created.json`).then(
+      ({ default: d }) => cloneEvent(d as Stripe.Event, id, created, 'requires_payment_method')
+    )
+    const succeededEvent = await import(`./stripe/payment_intent_succeeded.json`).then(
+      ({ default: d }) => cloneEvent(d as Stripe.Event, id, created, 'succeeded')
+    )
+
+    const config = getConfig()
+    const revalidatingSync = new StripeSync({
+      ...config,
+      revalidateObjectsViaStripeApi: ['payment_intent'],
+      poolConfig: {
+        connectionString: config.databaseUrl,
+      },
+    })
+    const stripe = Object.assign(revalidatingSync.stripe, mockStripe)
+    vitest.spyOn(revalidatingSync, 'stripe', 'get').mockReturnValue(stripe)
+
+    try {
+      // The revalidating fetch observes the still-pre-terminal state Stripe
+      // had at delivery time; the repair refetch sees canonical succeeded.
+      mockStripe.paymentIntents.retrieve
+        .mockResolvedValueOnce({ ...createdEvent.data.object })
+        .mockResolvedValue({ ...succeededEvent.data.object })
+
+      await revalidatingSync.processEvent(createdEvent)
+      expect(await paymentIntentStatus(id)).toEqual('requires_payment_method')
+
+      await revalidatingSync.processEvent(succeededEvent)
+      expect(await paymentIntentStatus(id)).toEqual('succeeded')
+      expect(mockStripe.paymentIntents.retrieve).toHaveBeenCalledTimes(2)
+    } finally {
+      await revalidatingSync.postgresClient.close()
+    }
+  })
 })

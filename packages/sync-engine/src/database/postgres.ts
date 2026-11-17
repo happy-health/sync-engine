@@ -114,11 +114,12 @@ export class PostgresClient {
       for (let k = 0; k < chunkResults.length; k++) {
         // Each write reports {applied, is_tie} from a single statement
         // (writable CTE, one snapshot — see the builder below). A guard-skipped
-        // UPDATE on an existing row (an INSERT always applies) is either a
-        // same-second tie — webhook sync timestamps come from event.created at
-        // integer-second resolution, so two events for one object inside the
-        // same second produce equal last_synced_at values the strict `<` guard
-        // cannot order — or a strictly-stale redelivery, which is the guard
+        // UPDATE on an existing row (an INSERT always applies) is either an
+        // unorderable same-second collision — webhook timestamps come from
+        // event.created at integer-second resolution while revalidated,
+        // retried, and backfilled rows carry wall-clock milliseconds, so
+        // stored-second <= attempted means the strict `<` guard cannot order
+        // the two writes — or a strictly-stale redelivery, which is the guard
         // working as intended and needs no repair.
         const verdict = chunkResults[k].rows[0] as { applied: boolean; is_tie: boolean | null }
         if (verdict.applied || !verdict.is_tie) continue
@@ -226,9 +227,13 @@ export class PostgresClient {
    * - applied = true: the INSERT or the guarded UPDATE applied.
    * - applied = false: the guard skipped an UPDATE on an existing row
    *   (an INSERT always applies), i.e. stored last_synced_at >= attempted.
-   * - is_tie (only meaningful when applied = false): stored <= attempted,
-   *   i.e. equal — a same-second tie that is unresolvable locally.
-   *   is_tie = false means strictly stale (stored > attempted).
+   * - is_tie (only meaningful when applied = false): the stored row's
+   *   second is not provably after the attempted write's instant — the
+   *   two cannot be ordered and the skip is repairable. Compared at
+   *   second granularity because last_synced_at mixes resolutions:
+   *   event-derived timestamps are integer-second, while revalidated,
+   *   retried, and backfilled writes are wall-clock millisecond.
+   *   is_tie = false means strictly stale (stored second > attempted).
    *
    * eg:
    *   WITH prev AS (
@@ -290,8 +295,15 @@ export class PostgresClient {
         -- ON CONFLICT guard cannot fail otherwise). An empty prev then means
         -- the row was inserted by a concurrent writer mid-statement — tie or
         -- stale-concurrent, either way canonical refetch is safe.
+        --
+        -- is_tie compares at second granularity: event timestamps carry
+        -- integer-second precision while revalidated/retried/backfilled
+        -- writes carry wall-clock milliseconds, so a stored row from either
+        -- domain can sit strictly later within the same second. Such a skip
+        -- is unorderable and repairable; only a stored row in a provably
+        -- later second is strictly stale.
         COALESCE(
-          (SELECT ("last_synced_at" <= :last_synced_at) FROM prev), true
+          (SELECT (date_trunc('second', "last_synced_at") <= :last_synced_at) FROM prev), true
         ) AS is_tie;`
   }
 
