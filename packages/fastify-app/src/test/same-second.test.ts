@@ -173,4 +173,26 @@ describe('same-second upsert protection', () => {
     expect(await setupIntentStatus(id)).toEqual('succeeded')
     expect(mockStripe.setupIntents.retrieve).toHaveBeenCalledTimes(1)
   })
+
+  /**
+   * Strictly-stale control: a stored row written by a NEWER event must not
+   * trigger a refetch at all — the guard is working as intended and the
+   * repair path only fires on ties (or unknown-concurrent skips).
+   */
+  test('g: newer stored row beats a strictly-older event — no refetch', async () => {
+    const id = `pi_same_second_g_${runId}`
+    const created = 1700000700
+    const succeededEvent = await import(`./stripe/payment_intent_succeeded.json`).then(
+      ({ default: d }) => cloneEvent(d as Stripe.Event, id, created + 1, 'succeeded')
+    )
+    const staleCreatedEvent = await import(`./stripe/payment_intent_created.json`).then(
+      ({ default: d }) => cloneEvent(d as Stripe.Event, id, created, 'requires_payment_method')
+    )
+
+    await stripeSync.processEvent(succeededEvent)
+    await stripeSync.processEvent(staleCreatedEvent)
+
+    expect(await paymentIntentStatus(id)).toEqual('succeeded')
+    expect(mockStripe.paymentIntents.retrieve).not.toHaveBeenCalled()
+  })
 })
