@@ -280,8 +280,11 @@ describe('same-second upsert protection', () => {
    * even though the two cannot be ordered — the stored second IS the
    * attempted write's second. The repair path must still fire.
    *
-   * Both events use the current wall-clock second because the revalidated
-   * write is stamped at real now() — in production, events arrive promptly.
+   * The succeeded event takes its created second from the stored
+   * revalidated row rather than a pre-computed now(): if the first write
+   * crossed a second boundary, a pre-computed value would put the second
+   * event in an earlier second — correctly strictly stale — and the test
+   * would stop exercising the same-second branch.
    */
   test('h: same-second event after a revalidated wall-clock write still refetches', async () => {
     const id = `pi_same_second_h_${runId}`
@@ -313,6 +316,13 @@ describe('same-second upsert protection', () => {
 
       await revalidatingSync.processEvent(createdEvent)
       expect(await paymentIntentStatus(id)).toEqual('requires_payment_method')
+
+      const { rows } = await stripeSync.postgresClient.query(
+        `select extract(epoch from date_trunc('second', last_synced_at))::bigint::text as second
+         from stripe.payment_intents where id = $1`,
+        [id]
+      )
+      succeededEvent.created = Number(rows[0].second)
 
       await revalidatingSync.processEvent(succeededEvent)
       expect(await paymentIntentStatus(id)).toEqual('succeeded')
